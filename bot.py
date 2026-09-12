@@ -3,8 +3,10 @@ import re
 import time
 import json
 import logging
+import html as htmlmod
+import xml.etree.ElementTree as ET
 from datetime import datetime
-from threading import Thread, Lock
+from threading import Thread
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -13,6 +15,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify
 
 SASMEX_URL = os.getenv("SASMEX_URL", "https://rss.sasmex.net/")
+SSN_URL = os.getenv("SSN_URL", "http://www.ssn.unam.mx/rss/ultimos-sismos.xml")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.getenv("CHAT_ID", "")
 CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "15"))
@@ -26,18 +29,17 @@ except Exception:
     TZ = ZoneInfo("America/Mexico_City")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sasmex-bot")
+log = logging.getLogger("sismosmp-bot")
 
 app = Flask(__name__)
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SASMEX-Telegram-Bot/2.0)"
-})
-state_lock = Lock()
+session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SismosMP-Bot/3.0)"})
+
 status_message_id = None
 last_check = None
 last_event_id = None
 connected = False
+source_status = {"SASMEX": False, "SSN": False}
 
 
 def now_local():
@@ -47,193 +49,158 @@ def now_local():
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return {
+                "sasmex_id": data.get("sasmex_id"),
+                "ssn_id": data.get("ssn_id"),
+            }
     except Exception:
-        return {"last_id": None}
+        return {"sasmex_id": None, "ssn_id": None}
 
 
-def save_state(last_id):
+def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_id": last_id}, f)
+            json.dump(state, f)
     except Exception as e:
         log.warning("No se pudo guardar estado: %s", e)
 
 
 def clean(text):
-    return re.sub(r"\s+", " ", (text or "")).strip()
+    return re.sub(r"\s+", " ", htmlmod.unescape(text or "")).strip()
 
 
-def row_to_item(row):
-    cells = [clean(c.get_text(" ", strip=True)) for c in row.find_all(["td", "th"])]
-    if not cells:
-        return None
-    joined = " | ".join(cells)
-    m = re.search(r"\b(20\d{12})\.cap\b", joined, re.I)
-    if not m:
-        return None
-    cap_id = m.group(1)
-    cap_url = None
-    for a in row.find_all("a", href=True):
-        href = a.get("href", "")
-        if re.search(re.escape(cap_id) + r"\.cap", href, re.I):
-            cap_url = urljoin(SASMEX_URL, href)
-            break
-    if not cap_url:
-        cap_url = urljoin(SASMEX_URL, f"{cap_id}.cap")
-
-    item = {
-        "id": cap_id,
-        "cap_url": cap_url,
-        "context": joined,
-        "state": cells[1] if len(cells) >= 2 else "",
-        "region": cells[2] if len(cells) >= 3 else "",
-        "kind": cells[3] if len(cells) >= 4 else "",
-    }
-    return item
+def parse_dt_id(text):
+    m = re.search(r"(20\d{2})[-/]?(\d{2})[-/]?(\d{2})[ T]?(\d{2})[:.]?(\d{2})[:.]?(\d{2})", text or "")
+    if m:
+        return "".join(m.groups())
+    return None
 
 
-def get_latest_from_homepage():
-    r = session.get(SASMEX_URL, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    candidates = []
-    for row in soup.find_all("tr"):
-        item = row_to_item(row)
-        if item:
-            candidates.append(item)
-
-    # Fallback for pages where CAP filenames are not inside table rows.
-    if not candidates:
-        text = soup.get_text(" ", strip=True)
-        ids = sorted(set(re.findall(r"\b(20\d{12})\.cap\b", text, re.I)), reverse=True)
-        for cap_id in ids:
-            candidates.append({
-                "id": cap_id,
-                "cap_url": urljoin(SASMEX_URL, f"{cap_id}.cap"),
-                "context": text[:3000],
-                "state": "",
-                "region": "",
-                "kind": "",
-            })
-
-    if not candidates:
-        # Last fallback: bare 14-digit timestamps in page text.
-        text = soup.get_text(" ", strip=True)
-        ids = sorted(set(re.findall(r"\b(20\d{12})\b", text)), reverse=True)
-        if ids:
-            cap_id = ids[0]
-            return {
-                "id": cap_id,
-                "cap_url": urljoin(SASMEX_URL, f"{cap_id}.cap"),
-                "context": text[:3000],
-                "state": "",
-                "region": "",
-                "kind": "",
-            }
-        raise RuntimeError("SASMEX respondió, pero no encontré registros CAP en la página.")
-
-    candidates.sort(key=lambda x: x["id"], reverse=True)
-    latest = candidates[0]
-
-    # Extract the visible "Último CAP" headline/severity when available.
-    page_text = clean(soup.get_text(" ", strip=True))
-    latest["page_text"] = page_text[:6000]
-    sev = re.search(r"Severidad\s*:\s*(Menor|Mayor|Minor|Major)", page_text, re.I)
-    if sev:
-        latest["page_severity"] = sev.group(1)
-
-    head = re.search(r"Sismo\s+en\s+(.{2,120}?)(?=\s+Severidad\s*:)", page_text, re.I)
-    if head:
-        latest["page_headline"] = clean(head.group(0))
-
-    return latest
-
-
-def parse_cap(cap_url):
-    if not cap_url:
-        return {}
+def format_date_from_id(event_id):
     try:
-        r = session.get(cap_url, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.content, "xml")
-        data = {}
-        for tag in [
-            "event", "severity", "urgency", "certainty", "headline", "description",
-            "areaDesc", "effective", "onset", "expires", "sent"
-        ]:
-            el = soup.find(tag)
-            if el and el.get_text(strip=True):
-                data[tag] = clean(el.get_text(" ", strip=True))
-
-        raw = soup.get_text(" ", strip=True)
-        mag = re.search(
-            r"(?:magnitud|magnitude)\s*[:=]?\s*M?\s*([0-9]+(?:[.,][0-9]+)?)",
-            raw, re.I,
-        )
-        if not mag:
-            mag = re.search(r"\bM\s*([0-9](?:[.,][0-9])?)\b", raw, re.I)
-        if mag:
-            data["magnitude"] = mag.group(1).replace(",", ".")
-        return data
-    except Exception as e:
-        log.warning("No se pudo leer CAP %s: %s", cap_url, e)
-        return {}
-
-
-def format_date(cap_id):
-    try:
-        dt = datetime.strptime(cap_id, "%Y%m%d%H%M%S")
+        dt = datetime.strptime(event_id, "%Y%m%d%H%M%S")
         return dt.strftime("%d/%m/%Y"), dt.strftime("%H:%M:%S")
     except Exception:
         return None, None
 
 
-def severity_values(item, cap):
-    severity = clean(cap.get("severity") or item.get("page_severity") or "")
-    low = severity.lower()
-    if low in ("menor", "minor"):
-        return "⚠️ <b>Sismo en Desarrollo</b> ⚠️", "MODERADO"
-    if low in ("mayor", "major"):
-        return "🚨 <b>ALERTA SÍSMICA</b> 🚨", "VIOLENTO"
-    return "⚠️ <b>Sismo en Desarrollo</b> ⚠️", "NO DETERMINADA"
+def parse_sasmex_page():
+    """Reads the SASMEX page/feed without requiring a .cap file."""
+    r = session.get(SASMEX_URL, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    page_text = clean(soup.get_text(" ", strip=True))
+
+    severity = ""
+    sev = re.search(r"Severidad\s*:\s*(Menor|Mayor|Minor|Major)", page_text, re.I)
+    if sev:
+        severity = sev.group(1)
+
+    candidates = []
+    for row in soup.find_all("tr"):
+        cells = [clean(c.get_text(" ", strip=True)) for c in row.find_all(["td", "th"])]
+        if not cells:
+            continue
+        joined = " | ".join(cells)
+        cap = re.search(r"\b(20\d{12})\.cap\b", joined, re.I)
+        event_id = cap.group(1) if cap else parse_dt_id(joined)
+        # SASMEX tables normally have: date/time | state | region | kind | file
+        if event_id and len(cells) >= 2:
+            candidates.append({
+                "id": event_id,
+                "source": "SASMEX",
+                "state": cells[1] if len(cells) > 1 else "",
+                "location": cells[2] if len(cells) > 2 else "",
+                "kind": cells[3] if len(cells) > 3 else "",
+                "context": joined,
+                "severity": severity,
+                "cap_url": urljoin(SASMEX_URL, f"{event_id}.cap") if cap else None,
+            })
+
+    # If no table event can be extracted, still consider SASMEX connected.
+    # We return a heartbeat-only object so the monitor does not show SIN CONEXIÓN.
+    if candidates:
+        candidates.sort(key=lambda x: x["id"], reverse=True)
+        item = candidates[0]
+        item["page_text"] = page_text[:6000]
+        return item
+
+    return {
+        "id": None,
+        "source": "SASMEX",
+        "state": "",
+        "location": "",
+        "kind": "",
+        "context": page_text[:2000],
+        "severity": severity,
+        "cap_url": None,
+        "page_text": page_text[:6000],
+    }
 
 
-def format_message(item, cap):
-    date, hour = format_date(item["id"])
-    title, intensity = severity_values(item, cap)
+def parse_ssn_feed():
+    """Reads the official SSN RSS and returns the newest earthquake item."""
+    r = session.get(SSN_URL, timeout=25)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
 
-    location = clean(cap.get("areaDesc") or item.get("region") or "")
-    if not location:
-        headline = clean(cap.get("headline") or item.get("page_headline") or "")
-        location = re.sub(r"^Sismo\s+en\s+", "", headline, flags=re.I).strip()
-    if not location:
-        location = "Ubicación no indicada por SASMEX"
+    items = root.findall(".//item")
+    if not items:
+        # Handle RSS namespaces, if present.
+        items = [el for el in root.iter() if el.tag.lower().endswith("}item") or el.tag.lower() == "item"]
+    if not items:
+        raise RuntimeError("El RSS del SSN respondió pero no contiene elementos item.")
 
-    magnitude = clean(cap.get("magnitude") or "")
-    state = clean(item.get("state") or "")
+    def val(item, name):
+        for child in list(item):
+            tag = child.tag.split("}")[-1].lower()
+            if tag == name.lower():
+                return clean(child.text or "")
+        return ""
 
-    lines = [
-        "#SismoDetectado #SismosMP",
-        "",
-        title,
-        "",
-        f"Iniciando en <b>{location}</b>",
-    ]
-    if date:
-        lines.append(f"Fecha: {date}")
-    if hour:
-        lines.append(f"Hora: {hour}")
-    lines.append(f"Intensidad: <b>{intensity}</b>")
-    if magnitude:
-        lines.append(f"Magnitud: <b>M {magnitude}</b>")
-    if state:
-        lines.append(f"Estado: {state}")
-    lines += ["", "📡 Fuente: SASMEX"]
-    if item.get("cap_url"):
-        lines.append(f'<a href="{item["cap_url"]}">Ver CAP</a>')
-    return "\n".join(lines)
+    parsed = []
+    for item in items:
+        title = val(item, "title")
+        description = val(item, "description")
+        link = val(item, "link")
+        guid = val(item, "guid")
+        pub = val(item, "pubDate")
+        raw = " | ".join(x for x in [title, description, pub, guid] if x)
+        event_id = parse_dt_id(raw)
+
+        # SSN titles commonly contain: Magnitud ... - ...
+        mag = ""
+        m = re.search(r"magnitud\s*([0-9]+(?:[.,][0-9]+)?)", raw, re.I)
+        if not m:
+            m = re.search(r"\bM\s*([0-9]+(?:[.,][0-9]+)?)", raw, re.I)
+        if m:
+            mag = m.group(1).replace(",", ".")
+
+        # Extract common SSN location phrase from description/title.
+        location = ""
+        lm = re.search(r"(?:localizad[oa]|epicentro|en)\s*[:\-]?\s*(.{5,160})", raw, re.I)
+        if lm:
+            location = clean(lm.group(1))
+            location = re.split(r"\s+(?:a\s+)?\d+(?:\.\d+)?\s*km\b", location, flags=re.I)[0].strip(" -")
+
+        if not event_id:
+            event_id = clean(guid or link or title)
+        parsed.append({
+            "id": event_id,
+            "source": "SSN",
+            "title": title,
+            "description": description,
+            "link": link,
+            "pubDate": pub,
+            "location": location,
+            "magnitude": mag,
+            "raw": raw,
+        })
+
+    # Prefer the most recent timestamp-like ID.
+    parsed.sort(key=lambda x: x["id"] if re.fullmatch(r"20\d{12}", x["id"] or "") else "", reverse=True)
+    return parsed[0]
 
 
 def telegram_api(method, data=None):
@@ -276,7 +243,7 @@ def telegram_edit_status(text):
                 "disable_notification": True,
             })
         except Exception as e:
-            log.info("No se pudo fijar el mensaje de estado: %s", e)
+            log.info("No se pudo fijar el estado: %s", e)
     else:
         try:
             telegram_api("editMessageText", {
@@ -295,15 +262,131 @@ def telegram_edit_status(text):
 
 def status_text():
     now = now_local().strftime("%d/%m/%Y %H:%M:%S")
-    state = "🟢 <b>CONECTADO</b>" if connected else "🔴 <b>SIN CONEXIÓN</b>"
+    sasmex = "🟢 <b>CONECTADO</b>" if source_status["SASMEX"] else "🔴 <b>SIN CONEXIÓN</b>"
     check = last_check.strftime("%H:%M:%S") if last_check else "--:--:--"
-    event = last_event_id or "Aún sin evento"
     return (
         "🟢 <b>MONITOREANDO SISMOS</b>\n\n"
-        f"📡 SASMEX: {state}\n"
+        f"📡 SASMEX: {sasmex}\n"
         f"🕐 Hora actual: <b>{now}</b>\n"
         f"🔄 Última revisión: <b>{check}</b>"
     )
+
+
+def sasmex_message(item):
+    event_id = item.get("id")
+    date, hour = format_date_from_id(event_id)
+    sev = (item.get("severity") or "").lower()
+    if sev in ("mayor", "major"):
+        title = "🚨 <b>ALERTA SÍSMICA</b> 🚨"
+        intensity = "VIOLENTO"
+    elif sev in ("menor", "minor"):
+        title = "⚠️ <b>Sismo en Desarrollo</b> ⚠️"
+        intensity = "MODERADO"
+    else:
+        title = "⚠️ <b>Sismo en Desarrollo</b> ⚠️"
+        intensity = "NO DETERMINADA"
+
+    location = clean(item.get("location") or "Ubicación no indicada por SASMEX")
+    lines = ["#SismoDetectado #SismosMP", "", title, "", f"Iniciando en <b>{location}</b>"]
+    if date:
+        lines.append(f"Fecha: {date}")
+    if hour:
+        lines.append(f"Hora: {hour}")
+    lines.append(f"Intensidad: <b>{intensity}</b>")
+    if item.get("state"):
+        lines.append(f"Estado: {clean(item['state'])}")
+    lines += ["", "📡 Fuente: SASMEX"]
+    if item.get("cap_url"):
+        lines.append(f'<a href="{htmlmod.escape(item["cap_url"], quote=True)}">Ver CAP</a>')
+    return "\n".join(lines)
+
+
+def ssn_message(item):
+    event_id = item.get("id")
+    date, hour = format_date_from_id(event_id)
+    location = clean(item.get("location") or item.get("title") or "Ubicación no indicada por SSN")
+    # SSN is the earthquake catalog source; it does not determine SASMEX alert severity.
+    lines = [
+        "#SismoDetectado #SismosMP",
+        "",
+        "🌎 <b>Sismo detectado</b>",
+        "",
+        f"Ubicación: <b>{location}</b>",
+    ]
+    if date:
+        lines.append(f"Fecha: {date}")
+    if hour:
+        lines.append(f"Hora: {hour}")
+    if item.get("magnitude"):
+        lines.append(f"Magnitud: <b>M {htmlmod.escape(item['magnitude'])}</b>")
+    lines += ["", "📡 Fuente: SSN"]
+    if item.get("link"):
+        lines.append(f'<a href="{htmlmod.escape(item["link"], quote=True)}">Ver registro SSN</a>')
+    return "\n".join(lines)
+
+
+def monitor():
+    global last_check, last_event_id, connected
+    log.info("Monitor iniciado: SASMEX + SSN; revisión cada %ss", CHECK_SECONDS)
+    state = load_state()
+    initialized_sasmex = state.get("sasmex_id") is not None
+    initialized_ssn = state.get("ssn_id") is not None
+
+    while True:
+        sasmex_item = None
+        ssn_item = None
+        try:
+            try:
+                sasmex_item = parse_sasmex_page()
+                source_status["SASMEX"] = True
+                if sasmex_item.get("id"):
+                    last_event_id = sasmex_item["id"]
+                    log.info("SASMEX OK. Último registro: %s", sasmex_item["id"])
+            except Exception as e:
+                source_status["SASMEX"] = False
+                log.warning("SASMEX error: %s", e)
+
+            try:
+                ssn_item = parse_ssn_feed()
+                source_status["SSN"] = True
+                log.info("SSN OK. Último sismo: %s", ssn_item.get("id"))
+            except Exception as e:
+                source_status["SSN"] = False
+                log.warning("SSN error: %s", e)
+
+            connected = source_status["SASMEX"] or source_status["SSN"]
+            last_check = now_local()
+
+            # First successful read establishes the baseline and does not publish old events.
+            if sasmex_item and sasmex_item.get("id"):
+                sid = sasmex_item["id"]
+                if not initialized_sasmex:
+                    state["sasmex_id"] = sid
+                    initialized_sasmex = True
+                    save_state(state)
+                    log.info("SASMEX inicializado con %s (sin publicar histórico).", sid)
+                elif sid != state.get("sasmex_id"):
+                    telegram_send(sasmex_message(sasmex_item))
+                    state["sasmex_id"] = sid
+                    save_state(state)
+                    log.info("Publicado nuevo evento SASMEX %s", sid)
+
+            if ssn_item and ssn_item.get("id"):
+                iid = ssn_item["id"]
+                if not initialized_ssn:
+                    state["ssn_id"] = iid
+                    initialized_ssn = True
+                    save_state(state)
+                    log.info("SSN inicializado con %s (sin publicar histórico).", iid)
+                elif iid != state.get("ssn_id"):
+                    telegram_send(ssn_message(ssn_item))
+                    state["ssn_id"] = iid
+                    save_state(state)
+                    log.info("Publicado nuevo sismo SSN %s", iid)
+
+        except Exception:
+            log.exception("Error durante la comprobación")
+        time.sleep(CHECK_SECONDS)
 
 
 def status_loop():
@@ -315,55 +398,24 @@ def status_loop():
         time.sleep(STATUS_SECONDS)
 
 
-def monitor():
-    global last_check, last_event_id, connected
-    log.info("Monitor iniciado: cada %ss; estado cada %ss", CHECK_SECONDS, STATUS_SECONDS)
-    state = load_state()
-    initialized = state.get("last_id") is not None
-
-    while True:
-        try:
-            item = get_latest_from_homepage()
-            current_id = item["id"]
-            last_check = now_local()
-            last_event_id = current_id
-            connected = True
-            log.info("SASMEX OK. Último CAP detectado: %s", current_id)
-
-            if not initialized:
-                save_state(current_id)
-                state["last_id"] = current_id
-                initialized = True
-                log.info("Inicializado con CAP %s (no se publica el histórico).", current_id)
-            elif current_id != state.get("last_id"):
-                cap = parse_cap(item.get("cap_url"))
-                msg = format_message(item, cap)
-                telegram_send(msg)
-                save_state(current_id)
-                state["last_id"] = current_id
-                log.info("Publicado CAP %s", current_id)
-        except Exception:
-            connected = False
-            log.exception("Error durante la comprobación")
-        time.sleep(CHECK_SECONDS)
-
-
 @app.get("/")
 def root():
-    return "SASMEX Telegram bot activo.", 200
+    return "SismosMP bot activo.", 200
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "sasmex-telegram-bot", "connected": connected, "last_event": last_event_id})
-
-
-def start_monitor():
-    Thread(target=monitor, daemon=True).start()
-    Thread(target=status_loop, daemon=True).start()
+    return jsonify({
+        "ok": True,
+        "sasmex_connected": source_status["SASMEX"],
+        "ssn_connected": source_status["SSN"],
+        "connected": connected,
+        "last_event": last_event_id,
+    })
 
 
 if __name__ == "__main__":
-    start_monitor()
+    Thread(target=monitor, daemon=True).start()
+    Thread(target=status_loop, daemon=True).start()
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
