@@ -3,9 +3,10 @@ import re
 import time
 import json
 import logging
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime
 from threading import Thread, Lock
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,8 +17,13 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.getenv("CHAT_ID", "")
 CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "15"))
 STATUS_SECONDS = int(os.getenv("STATUS_SECONDS", "5"))
+TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City")
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/sasmex_state.json")
-LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "America/Mexico_City"))
+
+try:
+    TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    TZ = ZoneInfo("America/Mexico_City")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sasmex-bot")
@@ -25,13 +31,18 @@ log = logging.getLogger("sasmex-bot")
 app = Flask(__name__)
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "SASMEX-Telegram-Bot/1.0 (+automatic monitoring)"
+    "User-Agent": "Mozilla/5.0 (compatible; SASMEX-Telegram-Bot/2.0)"
 })
 state_lock = Lock()
 status_message_id = None
 last_check = None
 last_event_id = None
 connected = False
+
+
+def now_local():
+    return datetime.now(TZ)
+
 
 def load_state():
     try:
@@ -40,6 +51,7 @@ def load_state():
     except Exception:
         return {"last_id": None}
 
+
 def save_state(last_id):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -47,8 +59,39 @@ def save_state(last_id):
     except Exception as e:
         log.warning("No se pudo guardar estado: %s", e)
 
+
 def clean(text):
     return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def row_to_item(row):
+    cells = [clean(c.get_text(" ", strip=True)) for c in row.find_all(["td", "th"])]
+    if not cells:
+        return None
+    joined = " | ".join(cells)
+    m = re.search(r"\b(20\d{12})\.cap\b", joined, re.I)
+    if not m:
+        return None
+    cap_id = m.group(1)
+    cap_url = None
+    for a in row.find_all("a", href=True):
+        href = a.get("href", "")
+        if re.search(re.escape(cap_id) + r"\.cap", href, re.I):
+            cap_url = urljoin(SASMEX_URL, href)
+            break
+    if not cap_url:
+        cap_url = urljoin(SASMEX_URL, f"{cap_id}.cap")
+
+    item = {
+        "id": cap_id,
+        "cap_url": cap_url,
+        "context": joined,
+        "state": cells[1] if len(cells) >= 2 else "",
+        "region": cells[2] if len(cells) >= 3 else "",
+        "kind": cells[3] if len(cells) >= 4 else "",
+    }
+    return item
+
 
 def get_latest_from_homepage():
     r = session.get(SASMEX_URL, timeout=20)
@@ -56,45 +99,57 @@ def get_latest_from_homepage():
     soup = BeautifulSoup(r.text, "html.parser")
 
     candidates = []
-    # Prefer links to CAP files. SASMEX pages commonly expose filenames like 20260903053425.cap.
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        full = requests.compat.urljoin(SASMEX_URL, href)
-        m = re.search(r"(\d{14})\.cap(?:$|[?#])", href, re.I)
-        if m:
+    for row in soup.find_all("tr"):
+        item = row_to_item(row)
+        if item:
+            candidates.append(item)
+
+    # Fallback for pages where CAP filenames are not inside table rows.
+    if not candidates:
+        text = soup.get_text(" ", strip=True)
+        ids = sorted(set(re.findall(r"\b(20\d{12})\.cap\b", text, re.I)), reverse=True)
+        for cap_id in ids:
             candidates.append({
-                "id": m.group(1),
-                "cap_url": full,
-                "text": clean(a.get_text(" ", strip=True)),
+                "id": cap_id,
+                "cap_url": urljoin(SASMEX_URL, f"{cap_id}.cap"),
+                "context": text[:3000],
+                "state": "",
+                "region": "",
+                "kind": "",
             })
 
-    if candidates:
-        # Newest CAP timestamp wins.
-        candidates.sort(key=lambda x: x["id"], reverse=True)
-        latest = candidates[0]
-        # Get nearby row/card text for human-readable fields.
-        anchor = next((a for a in soup.find_all("a", href=True)
-                       if re.search(re.escape(latest["id"]) + r"\.cap", a.get("href",""), re.I)), None)
-        context = ""
-        if anchor:
-            node = anchor
-            for _ in range(4):
-                if getattr(node, "parent", None):
-                    node = node.parent
-                    txt = clean(node.get_text(" ", strip=True))
-                    if len(txt) > len(context) and len(txt) < 1000:
-                        context = txt
-        latest["context"] = context
-        return latest
+    if not candidates:
+        # Last fallback: bare 14-digit timestamps in page text.
+        text = soup.get_text(" ", strip=True)
+        ids = sorted(set(re.findall(r"\b(20\d{12})\b", text)), reverse=True)
+        if ids:
+            cap_id = ids[0]
+            return {
+                "id": cap_id,
+                "cap_url": urljoin(SASMEX_URL, f"{cap_id}.cap"),
+                "context": text[:3000],
+                "state": "",
+                "region": "",
+                "kind": "",
+            }
+        raise RuntimeError("SASMEX respondió, pero no encontré registros CAP en la página.")
 
-    # Fallback: find a 14-digit CAP-like timestamp anywhere in the page.
-    text = soup.get_text(" ", strip=True)
-    ids = re.findall(r"\b(20\d{12})\b", text)
-    if ids:
-        latest_id = max(ids)
-        return {"id": latest_id, "cap_url": None, "text": "", "context": text[:1200]}
+    candidates.sort(key=lambda x: x["id"], reverse=True)
+    latest = candidates[0]
 
-    raise RuntimeError("No encontré un archivo CAP en la página de SASMEX.")
+    # Extract the visible "Último CAP" headline/severity when available.
+    page_text = clean(soup.get_text(" ", strip=True))
+    latest["page_text"] = page_text[:6000]
+    sev = re.search(r"Severidad\s*:\s*(Menor|Mayor|Minor|Major)", page_text, re.I)
+    if sev:
+        latest["page_severity"] = sev.group(1)
+
+    head = re.search(r"Sismo\s+en\s+(.{2,120}?)(?=\s+Severidad\s*:)", page_text, re.I)
+    if head:
+        latest["page_headline"] = clean(head.group(0))
+
+    return latest
+
 
 def parse_cap(cap_url):
     if not cap_url:
@@ -104,15 +159,19 @@ def parse_cap(cap_url):
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "xml")
         data = {}
-        # CAP standard fields; tolerate namespaces.
-        for tag in ["event", "severity", "urgency", "certainty", "headline", "description",
-                    "areaDesc", "geocode", "effective", "onset", "expires", "sent"]:
+        for tag in [
+            "event", "severity", "urgency", "certainty", "headline", "description",
+            "areaDesc", "effective", "onset", "expires", "sent"
+        ]:
             el = soup.find(tag)
             if el and el.get_text(strip=True):
                 data[tag] = clean(el.get_text(" ", strip=True))
-        # Look for common magnitude representations.
+
         raw = soup.get_text(" ", strip=True)
-        mag = re.search(r"(?:magnitud|magnitude)\s*[:=]?\s*M?\s*([0-9]+(?:[.,][0-9]+)?)", raw, re.I)
+        mag = re.search(
+            r"(?:magnitud|magnitude)\s*[:=]?\s*M?\s*([0-9]+(?:[.,][0-9]+)?)",
+            raw, re.I,
+        )
         if not mag:
             mag = re.search(r"\bM\s*([0-9](?:[.,][0-9])?)\b", raw, re.I)
         if mag:
@@ -122,6 +181,7 @@ def parse_cap(cap_url):
         log.warning("No se pudo leer CAP %s: %s", cap_url, e)
         return {}
 
+
 def format_date(cap_id):
     try:
         dt = datetime.strptime(cap_id, "%Y%m%d%H%M%S")
@@ -129,52 +189,52 @@ def format_date(cap_id):
     except Exception:
         return None, None
 
+
+def severity_values(item, cap):
+    severity = clean(cap.get("severity") or item.get("page_severity") or "")
+    low = severity.lower()
+    if low in ("menor", "minor"):
+        return "⚠️ <b>Sismo en Desarrollo</b> ⚠️", "MODERADO"
+    if low in ("mayor", "major"):
+        return "🚨 <b>ALERTA SÍSMICA</b> 🚨", "VIOLENTO"
+    return "⚠️ <b>Sismo en Desarrollo</b> ⚠️", "NO DETERMINADA"
+
+
 def format_message(item, cap):
     date, hour = format_date(item["id"])
-    context = item.get("context", "")
-    # Try to extract common fields from the visible row/card.
-    state = ""
-    region = ""
-    kind = ""
-    m = re.search(r"\bEstado\s*[:\-]\s*([^|]+?)(?=\s+(?:Región|Tipo)\s*[:\-]|$)", context, re.I)
-    if m: state = clean(m.group(1))
-    m = re.search(r"\bRegi[oó]n\s*[:\-]\s*([^|]+?)(?=\s+(?:Estado|Tipo)\s*[:\-]|$)", context, re.I)
-    if m: region = clean(m.group(1))
-    m = re.search(r"\bTipo\s*[:\-]\s*([^|]+?)(?=\s+(?:Estado|Regi[oó]n)\s*[:\-]|$)", context, re.I)
-    if m: kind = clean(m.group(1))
+    title, intensity = severity_values(item, cap)
 
-    headline = cap.get("headline") or cap.get("event") or ""
-    area = cap.get("areaDesc") or ""
-    severity_raw = cap.get("severity") or ""
-    magnitude = cap.get("magnitude") or ""
+    location = clean(cap.get("areaDesc") or item.get("region") or "")
+    if not location:
+        headline = clean(cap.get("headline") or item.get("page_headline") or "")
+        location = re.sub(r"^Sismo\s+en\s+", "", headline, flags=re.I).strip()
+    if not location:
+        location = "Ubicación no indicada por SASMEX"
 
-    # SASMEX usa dos severidades. Adaptamos el texto al diseño de Sismos MP.
-    sev = clean(severity_raw).lower()
-    if sev in ("menor", "minor"):
-        alert_title = "⚠️ <b>Sismo en Desarrollo</b> ⚠️"
-        intensity = "MODERADO"
-    elif sev in ("mayor", "major"):
-        alert_title = "🚨 <b>ALERTA SÍSMICA</b> 🚨"
-        intensity = "VIOLENTO"
-    else:
-        alert_title = "⚠️ <b>Sismo en Desarrollo</b> ⚠️"
-        intensity = "NO DETERMINADA"
+    magnitude = clean(cap.get("magnitude") or "")
+    state = clean(item.get("state") or "")
 
-    # Prefer CAP area description; otherwise use region/headline.
-    location = area or region or clean(re.sub(r"(?i)sismo\s*(en)?", "", headline)).strip()
-
-    lines = ["#SismoDetectado #SismosMP", "", alert_title, ""]
-    if location:
-        lines.append(f"Iniciando en <b>{location}</b>")
-    if date: lines.append(f"Fecha: {date}")
-    if hour: lines.append(f"Hora: {hour}")
+    lines = [
+        "#SismoDetectado #SismosMP",
+        "",
+        title,
+        "",
+        f"Iniciando en <b>{location}</b>",
+    ]
+    if date:
+        lines.append(f"Fecha: {date}")
+    if hour:
+        lines.append(f"Hora: {hour}")
     lines.append(f"Intensidad: <b>{intensity}</b>")
-    if magnitude: lines.append(f"Magnitud: <b>M {magnitude}</b>")
-    if state: lines.append(f"Estado: {state}")
+    if magnitude:
+        lines.append(f"Magnitud: <b>M {magnitude}</b>")
+    if state:
+        lines.append(f"Estado: {state}")
     lines += ["", "📡 Fuente: SASMEX"]
     if item.get("cap_url"):
         lines.append(f'<a href="{item["cap_url"]}">Ver CAP</a>')
     return "\n".join(lines)
+
 
 def telegram_api(method, data=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -185,6 +245,7 @@ def telegram_api(method, data=None):
         raise RuntimeError(payload.get("description", "Telegram API error"))
     return payload
 
+
 def telegram_send(text):
     if not CHAT_ID:
         raise RuntimeError("Falta CHAT_ID.")
@@ -194,6 +255,7 @@ def telegram_send(text):
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     })
+
 
 def telegram_edit_status(text):
     global status_message_id
@@ -207,7 +269,6 @@ def telegram_edit_status(text):
             "disable_web_page_preview": True,
         })
         status_message_id = result["result"]["message_id"]
-        # Try to pin it; this requires the bot to have pin permission. Failure is harmless.
         try:
             telegram_api("pinChatMessage", {
                 "chat_id": CHAT_ID,
@@ -215,7 +276,7 @@ def telegram_edit_status(text):
                 "disable_notification": True,
             })
         except Exception as e:
-            log.info("No se pudo fijar el mensaje de estado (se puede hacer manualmente): %s", e)
+            log.info("No se pudo fijar el mensaje de estado: %s", e)
     else:
         try:
             telegram_api("editMessageText", {
@@ -226,37 +287,33 @@ def telegram_edit_status(text):
                 "disable_web_page_preview": True,
             })
         except requests.HTTPError as e:
-            # If the message was deleted, recreate it on next cycle.
             if getattr(e.response, "status_code", None) == 400:
                 status_message_id = None
             else:
                 raise
 
+
 def status_text():
-    now = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S")
-    if connected:
-        state = "🟢 <b>CONECTADO</b>"
-    else:
-        state = "🔴 <b>SIN CONEXIÓN</b>"
-    check = last_check.astimezone(LOCAL_TZ).strftime("%H:%M:%S") if last_check else "--:--:--"
+    now = now_local().strftime("%d/%m/%Y %H:%M:%S")
+    state = "🟢 <b>CONECTADO</b>" if connected else "🔴 <b>SIN CONEXIÓN</b>"
+    check = last_check.strftime("%H:%M:%S") if last_check else "--:--:--"
     event = last_event_id or "Aún sin evento"
     return (
         "🟢 <b>MONITOREANDO SISMOS</b>\n\n"
         f"📡 SASMEX: {state}\n"
         f"🕐 Hora actual: <b>{now}</b>\n"
-        f"🔄 Última revisión: <b>{check}</b>\n"
-        f"⚡ Monitoreo: cada <b>{CHECK_SECONDS} segundos</b>\n"
-        f"🚨 Último CAP: <code>{event}</code>"
+        f"🔄 Última revisión: <b>{check}</b>"
     )
 
+
 def status_loop():
-    global connected
     while True:
         try:
             telegram_edit_status(status_text())
         except Exception:
             log.exception("No se pudo actualizar el mensaje de estado")
         time.sleep(STATUS_SECONDS)
+
 
 def monitor():
     global last_check, last_event_id, connected
@@ -268,9 +325,10 @@ def monitor():
         try:
             item = get_latest_from_homepage()
             current_id = item["id"]
-            last_check = datetime.now().astimezone()
+            last_check = now_local()
             last_event_id = current_id
             connected = True
+            log.info("SASMEX OK. Último CAP detectado: %s", current_id)
 
             if not initialized:
                 save_state(current_id)
@@ -289,17 +347,21 @@ def monitor():
             log.exception("Error durante la comprobación")
         time.sleep(CHECK_SECONDS)
 
+
 @app.get("/")
 def root():
     return "SASMEX Telegram bot activo.", 200
 
+
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "sasmex-telegram-bot"})
+    return jsonify({"ok": True, "service": "sasmex-telegram-bot", "connected": connected, "last_event": last_event_id})
+
 
 def start_monitor():
     Thread(target=monitor, daemon=True).start()
     Thread(target=status_loop, daemon=True).start()
+
 
 if __name__ == "__main__":
     start_monitor()
