@@ -14,5 +14,3 @@ services:
         value: "15"
       - key: SASMEX_URL
         value: "https://rss.sasmex.net/"
-      - key: TIMEZONE
-        value: "America/Mexico_City"

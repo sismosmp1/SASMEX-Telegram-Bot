@@ -13,6 +13,3 @@ La primera vez que arranca, el bot memoriza el CAP más reciente y NO lo publica
 
 ## Despliegue
 Pensado para Render como Web Service. Render Free tiene 750 horas/mes y los servicios gratuitos se duermen tras 15 min sin tráfico; para mantenerlo despierto se puede usar un monitor externo que visite `/health` cada pocos minutos. Ver documentación oficial de Render.
-
-
-Diseño Sismos MP: Menor -> MODERADO/Sismo en Desarrollo; Mayor -> VIOLENTO/ALERTA SISMICA.

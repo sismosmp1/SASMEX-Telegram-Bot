@@ -20,7 +20,7 @@ SASMEX_TELEGRAM_URL = os.getenv("SASMEX_TELEGRAM_URL", "https://t.me/s/sasmexnet
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.getenv("CHAT_ID", "")
 CHECK_SECONDS = float(os.getenv("CHECK_SECONDS", "1.5"))
-STATUS_SECONDS = float(os.getenv("STATUS_SECONDS", "1.5"))
+STATUS_SECONDS = float(os.getenv("STATUS_SECONDS", "5"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City")
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/sasmex_state.json")
 
@@ -36,6 +36,30 @@ session = requests.Session()
 session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SismosMP-Bot/4.0)"})
 
 status_message_id = None
+
+def load_saved_status_id():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("status_message_id")
+    except Exception as e:
+        print("No se pudo cargar el ID del estado:", e)
+    return None
+
+def save_status_id(mid):
+    try:
+        data = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data["status_message_id"] = mid
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("No se pudo guardar el ID del estado:", e)
+
+status_message_id = load_saved_status_id()
 last_check = None
 last_event_id = None
 connected = False
@@ -212,7 +236,7 @@ def parse_sasmex_telegram():
             "text": text,
             "event_id": dt_id,
             "published": published,
-            "url": f"https://t.me/SASMEX_Oficial/{post_id}",
+            "url": f"https://t.me/sasmexnet/{post_id}",
         })
 
     if not parsed:
@@ -254,6 +278,30 @@ def telegram_edit_status(text):
         except requests.HTTPError as e:
             if getattr(e.response, "status_code", None) == 400:
                 status_message_id = None
+
+def load_saved_status_id():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("status_message_id")
+    except Exception as e:
+        print("No se pudo cargar el ID del estado:", e)
+    return None
+
+def save_status_id(mid):
+    try:
+        data = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data["status_message_id"] = mid
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("No se pudo guardar el ID del estado:", e)
+
+status_message_id = load_saved_status_id()
             else:
                 raise
 
