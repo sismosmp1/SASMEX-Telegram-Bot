@@ -16,11 +16,11 @@ from flask import Flask, jsonify
 
 SASMEX_URL = os.getenv("SASMEX_URL", "https://rss.sasmex.net/")
 SSN_URL = os.getenv("SSN_URL", "http://www.ssn.unam.mx/rss/ultimos-sismos.xml")
-SASMEX_TELEGRAM_URL = os.getenv("SASMEX_TELEGRAM_URL", "https://t.me/s/SASMEX_Oficial")
+SASMEX_TELEGRAM_URL = os.getenv("SASMEX_TELEGRAM_URL", "https://t.me/s/sasmexnet")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.getenv("CHAT_ID", "")
-CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "15"))
-STATUS_SECONDS = int(os.getenv("STATUS_SECONDS", "5"))
+CHECK_SECONDS = float(os.getenv("CHECK_SECONDS", "1.5"))
+STATUS_SECONDS = float(os.getenv("STATUS_SECONDS", "1.5"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City")
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/sasmex_state.json")
 
@@ -259,10 +259,9 @@ def telegram_edit_status(text):
 
 
 def status_text():
-    now = now_local().strftime("%d/%m/%Y %H:%M:%S")
     sasmex = "🟢 <b>CONECTADO</b>" if source_status["SASMEX"] else "🔴 <b>SIN CONEXIÓN</b>"
     check = last_check.strftime("%H:%M:%S") if last_check else "--:--:--"
-    return "🟢 <b>MONITOREANDO SISMOS</b>\n\n" f"📡 SASMEX: {sasmex}\n" f"🕐 Hora actual: <b>{now}</b>\n" f"🔄 Última revisión: <b>{check}</b>"
+    return "🟢 <b>MONITOREANDO SISMOS</b>\n\n" f"📡 SASMEX: {sasmex}\n" f"🔄 Última revisión: <b>{check}</b>"
 
 
 def sasmex_message(item):
@@ -276,12 +275,12 @@ def sasmex_message(item):
     else:
         title, intensity = "⚠️ <b>Sismo en Desarrollo</b> ⚠️", "NO DETERMINADA"
     location = clean(item.get("location") or "Ubicación no indicada por SASMEX")
-    lines = ["#SismoDetectado #SismosMP", "", title, "", f"Iniciando en <b>{location}</b>"]
+    lines = ["#SismoEnDesarrollo #SISMOSMP", "", title, "", f"Iniciando en <b>{location}</b>"]
     if date: lines.append(f"Fecha: {date}")
     if hour: lines.append(f"Hora: {hour}")
     lines.append(f"Intensidad: <b>{intensity}</b>")
     if item.get("state"): lines.append(f"Estado: {clean(item['state'])}")
-    lines += ["", "📡 Fuente: SASMEX"]
+    lines += ["", "📡 Vía: Sistema de Alerta Sísmica Mexicano"]
     if item.get("cap_url"): lines.append(f'<a href="{htmlmod.escape(item["cap_url"], quote=True)}">Ver CAP</a>')
     return "\n".join(lines)
 
@@ -290,11 +289,11 @@ def ssn_message(item):
     event_id = item.get("id")
     date, hour = format_date_from_id(event_id)
     location = clean(item.get("location") or item.get("title") or "Ubicación no indicada por SSN")
-    lines = ["#SismoDetectado #SismosMP", "", "🌎 <b>Sismo detectado</b>", "", f"Ubicación: <b>{location}</b>"]
+    lines = ["#SismoDetectado #SISMOSMP", "", "🌎 <b>Sismo Reportado Por el SSN</b>", "", f"Ubicación: <b>{location}</b>"]
     if date: lines.append(f"Fecha: {date}")
     if hour: lines.append(f"Hora: {hour}")
     if item.get("magnitude"): lines.append(f"Magnitud: <b>M {htmlmod.escape(item['magnitude'])}</b>")
-    lines += ["", "📡 Fuente: SSN"]
+    lines += ["", "📡 Vía: Servicio Sismológico Nacional"]
     if item.get("link"): lines.append(f'<a href="{htmlmod.escape(item["link"], quote=True)}">Ver registro SSN</a>')
     return "\n".join(lines)
 
@@ -302,7 +301,7 @@ def ssn_message(item):
 def sasmex_telegram_message(item):
     text = clean(item.get("text", ""))
     # Keep the official wording visible, but wrap it in our channel format.
-    return "#SismoDetectado #SismosMP\n\n📱 <b>SASMEX Oficial</b>\n\n" + htmlmod.escape(text) + f'\n\n📡 Fuente: <a href="{item["url"]}">SASMEX Oficial en Telegram</a>'
+    return "#SismoEnDesarrollo #SISMOSMP\n\n⚠️ <b>SismoEnDesarrollo</b> ⚠️\n\n" + htmlmod.escape(text) + "\n\n📡 Vía: Sistema de Alerta Sísmica Mexicano"
 
 
 def event_key(item, source):
